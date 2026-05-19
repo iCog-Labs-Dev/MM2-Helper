@@ -9,6 +9,20 @@ Current helpers included:
 - `cdr`
 - `cons`
 - `decons`
+- `partitions`
+
+`partitions` receives a tuple and returns all non-empty disjoint partitions that cover
+the tuple, excluding the single full-tuple block. For example:
+
+```lisp
+(partitions (a b c))
+```
+
+returns partitions shaped like:
+
+```lisp
+(((a b) (c)) ((a c) (b)) ((a) (b c)) ((a) (b) (c)))
+```
 
 ## What this package does
 
