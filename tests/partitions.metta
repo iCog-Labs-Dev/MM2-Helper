@@ -11,3 +11,10 @@
 
 (input simple (a b c))
 (input pattern ((Inheritance abe kebe) (Inheritance abe human) (Inheritance kebe human)))
+
+
+
+
+
+
+
