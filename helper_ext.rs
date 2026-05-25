@@ -98,6 +98,37 @@ fn write_partitions(sink: &mut ExprSink, partitions: &[Vec<Vec<Expr>>]) -> Resul
     Ok(())
 }
 
+fn factorial_i64(n: i64) -> Result<i64, EvalError> {
+    if n < 0 {
+        return Err(EvalError::from("factorial expects n >= 0"));
+    }
+
+    let mut result = 1i64;
+    for i in 2..=n {
+        result = result
+            .checked_mul(i)
+            .ok_or_else(|| EvalError::from("factorial overflow"))?;
+    }
+    Ok(result)
+}
+
+fn falling_factorial_i64(n: i64, k: i64) -> Result<i64, EvalError> {
+    if n < 0 || k < 0 {
+        return Err(EvalError::from("falling_factorial expects n >= 0 and k >= 0"));
+    }
+    if k > n {
+        return Err(EvalError::from("falling_factorial expects k <= n"));
+    }
+
+    let mut result = 1i64;
+    for i in 0..k {
+        result = result
+            .checked_mul(n - i)
+            .ok_or_else(|| EvalError::from("falling_factorial overflow"))?;
+    }
+    Ok(result)
+}
+
 pub extern "C" fn length(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
     let expr = unsafe { &mut *expr };
     let sink = unsafe { &mut *sink };
@@ -178,6 +209,37 @@ pub extern "C" fn partitions(expr: *mut ExprSource, sink: *mut ExprSink) -> Resu
     write_partitions(sink, &out)
 }
 
+pub extern "C" fn factorial(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
+    let expr = unsafe { &mut *expr };
+    let sink = unsafe { &mut *sink };
+
+    let items = expr.consume_head_check(b"factorial")?;
+    if items != 1 {
+        return Err(EvalError::from("factorial takes one argument"));
+    }
+
+    let n = expr.consume::<i64>()?;
+    let result = factorial_i64(n)?;
+    sink.write(SourceItem::Symbol(result.to_be_bytes()[..].into()))?;
+    Ok(())
+}
+
+pub extern "C" fn falling_factorial(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
+    let expr = unsafe { &mut *expr };
+    let sink = unsafe { &mut *sink };
+
+    let items = expr.consume_head_check(b"falling_factorial")?;
+    if items != 2 {
+        return Err(EvalError::from("falling_factorial takes two arguments"));
+    }
+
+    let n = expr.consume::<i64>()?;
+    let k = expr.consume::<i64>()?;
+    let result = falling_factorial_i64(n, k)?;
+    sink.write(SourceItem::Symbol(result.to_be_bytes()[..].into()))?;
+    Ok(())
+}
+
 pub fn register(scope: &mut EvalScope) {
     scope.add_func("length", length, FuncType::Pure);
     scope.add_func("car", car, FuncType::Pure);
@@ -185,4 +247,6 @@ pub fn register(scope: &mut EvalScope) {
     scope.add_func("cons", cons, FuncType::Pure);
     scope.add_func("decons", decons, FuncType::Pure);
     scope.add_func("partitions", partitions, FuncType::Pure);
+    scope.add_func("factorial", factorial, FuncType::Pure);
+    scope.add_func("falling_factorial", falling_factorial, FuncType::Pure);
 }
