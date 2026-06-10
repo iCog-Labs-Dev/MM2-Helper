@@ -120,6 +120,101 @@ fn push_tuple_from_items(out: &mut Vec<u8>, items: &[Expr]) -> Result<(), EvalEr
     Ok(())
 }
 
+fn write_var_marker(sink: &mut ExprSink, index: usize) -> Result<(), EvalError> {
+    let index = index.to_string();
+    sink.write(SourceItem::Tag(Tag::Arity(2)))?;
+    sink.write(SourceItem::Symbol(b"var"))?;
+    sink.write(SourceItem::Symbol(index.as_bytes()))?;
+    Ok(())
+}
+
+fn parse_var_marker_index(symbol: &[u8]) -> Result<u8, EvalError> {
+    if symbol.is_empty() {
+        return Err(EvalError::from("var marker index can not be empty"));
+    }
+
+    let mut index = 0u16;
+    for &b in symbol {
+        if !b.is_ascii_digit() {
+            return Err(EvalError::from("var marker index must be decimal digits"));
+        }
+        index = index * 10 + (b - b'0') as u16;
+        if index >= 64 {
+            return Err(EvalError::from("var marker index must be less than 64"));
+        }
+    }
+
+    Ok(index as u8)
+}
+
+fn var_marker_index(e: Expr) -> Result<Option<u8>, EvalError> {
+    unsafe {
+        let Tag::Arity(2) = mork_expr::byte_item(*e.ptr) else {
+            return Ok(None);
+        };
+
+        let mut offset = 1usize;
+        let Tag::SymbolSize(head_len) = mork_expr::byte_item(*e.ptr.add(offset)) else {
+            return Ok(None);
+        };
+        offset += 1;
+        let head = std::slice::from_raw_parts(e.ptr.add(offset), head_len as usize);
+        if head != b"var" {
+            return Ok(None);
+        }
+        offset += head_len as usize;
+
+        let Tag::SymbolSize(index_len) = mork_expr::byte_item(*e.ptr.add(offset)) else {
+            return Err(EvalError::from("var marker index must be a symbol"));
+        };
+        offset += 1;
+        let index = std::slice::from_raw_parts(e.ptr.add(offset), index_len as usize);
+        Ok(Some(parse_var_marker_index(index)?))
+    }
+}
+
+fn write_indices_as_vars(e: Expr, sink: &mut ExprSink, introduced: &mut u8) -> Result<(), EvalError> {
+    if let Some(index) = var_marker_index(e)? {
+        if index == *introduced {
+            sink.write(SourceItem::Tag(Tag::NewVar))?;
+            *introduced += 1;
+        } else if index < *introduced {
+            sink.write(SourceItem::Tag(Tag::VarRef(index)))?;
+        } else {
+            return Err(EvalError::from("var marker index appears before its introduction"));
+        }
+        return Ok(());
+    }
+
+    unsafe {
+        match mork_expr::byte_item(*e.ptr) {
+            Tag::NewVar => {
+                if *introduced >= 64 {
+                    return Err(EvalError::from("can only introduce up to 64 variables"));
+                }
+                sink.write(SourceItem::Tag(Tag::NewVar))?;
+                *introduced += 1;
+            }
+            Tag::VarRef(i) => {
+                sink.write(SourceItem::Tag(Tag::VarRef(i)))?;
+            }
+            Tag::SymbolSize(size) => {
+                let symbol = std::slice::from_raw_parts(e.ptr.add(1), size as usize);
+                sink.write(SourceItem::Symbol(symbol))?;
+            }
+            Tag::Arity(arity) => {
+                sink.write(SourceItem::Tag(Tag::Arity(arity)))?;
+                let mut offset = 1usize;
+                for _ in 0..arity {
+                    let child = Expr { ptr: e.ptr.add(offset) };
+                    write_indices_as_vars(child, sink, introduced)?;
+                    offset += expr_span(child).len();
+                }
+            }
+        }
+    }
+
+    Ok(())
 fn write_expr(sink: &mut ExprSink, expr: Expr) -> Result<(), EvalError> {
     write_normalized_expr(sink, expr_span(expr).to_vec())
 }
@@ -301,6 +396,68 @@ pub extern "C" fn partitions(expr: *mut ExprSource, sink: *mut ExprSink) -> Resu
     write_partitions(sink, &out)
 }
 
+fn expr_is_var(e: Expr) -> Result<bool, EvalError> {
+    let raw_var = matches!(unsafe { mork_expr::byte_item(*e.ptr) }, Tag::NewVar | Tag::VarRef(_));
+    Ok(raw_var || var_marker_index(e)?.is_some())
+}
+
+pub extern "C" fn is_var(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
+    let expr = unsafe { &mut *expr };
+    let sink = unsafe { &mut *sink };
+
+    let e = consume_named_expr_1(expr, b"is_var")?;
+    let value = [u8::from(expr_is_var(e)?)];
+    sink.write(SourceItem::Symbol(&value))?;
+    Ok(())
+}
+
+pub extern "C" fn vars_to_indices(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
+    let expr = unsafe { &mut *expr };
+    let sink = unsafe { &mut *sink };
+
+    let e = consume_named_expr_1(expr, b"vars_to_indices")?;
+    let mut ez = mork_expr::ExprZipper::new(e);
+    let mut intro = 0usize;
+
+    loop {
+        match ez.item() {
+            Ok(Tag::NewVar) => {
+                if intro >= 64 {
+                    return Err(EvalError::from("can only introduce up to 64 variables"));
+                }
+                write_var_marker(sink, intro)?;
+                intro += 1;
+            }
+            Ok(Tag::VarRef(i)) => {
+                if i == 0 {
+                    return Err(EvalError::from("var reference points outside vars_to_indices argument"));
+                }
+                write_var_marker(sink, (i - 1) as usize)?;
+            }
+            Ok(Tag::Arity(a)) => {
+                sink.write(SourceItem::Tag(Tag::Arity(a)))?;
+            }
+            Ok(Tag::SymbolSize(_)) => unreachable!(),
+            Err(symbol) => {
+                sink.write(SourceItem::Symbol(symbol))?;
+            }
+        }
+
+        if !ez.next() {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+pub extern "C" fn indices_to_vars(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
+    let expr = unsafe { &mut *expr };
+    let sink = unsafe { &mut *sink };
+
+    let e = consume_named_expr_1(expr, b"indices_to_vars")?;
+    let mut introduced = 0u8;
+    write_indices_as_vars(e, sink, &mut introduced)
 pub extern "C" fn freshen_pattern(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
     let expr = unsafe { &mut *expr };
     let sink = unsafe { &mut *sink };
@@ -347,6 +504,9 @@ pub fn register(scope: &mut EvalScope) {
     scope.add_func("cons", cons, FuncType::Pure);
     scope.add_func("decons", decons, FuncType::Pure);
     scope.add_func("partitions", partitions, FuncType::Pure);
+    scope.add_func("is_var", is_var, FuncType::Pure);
+    scope.add_func("vars_to_indices", vars_to_indices, FuncType::Pure);
+    scope.add_func("indices_to_vars", indices_to_vars, FuncType::Pure);
     scope.add_func("freshen-pattern", freshen_pattern, FuncType::Pure);
     scope.add_func("factorial", factorial, FuncType::Pure);
     scope.add_func("falling_factorial", falling_factorial, FuncType::Pure);
