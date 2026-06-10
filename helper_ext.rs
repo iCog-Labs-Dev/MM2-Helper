@@ -1,6 +1,6 @@
 use eval::{EvalScope, FuncType};
 use eval_ffi::{EvalError, ExprSink, ExprSource, Tag};
-use mork_expr::{Expr, ExprEnv, SourceItem};
+use mork_expr::{item_byte, Expr, ExprEnv, ExprZipper, SourceItem};
 use std::collections::HashSet;
 
 fn expr_span(e: Expr) -> &'static [u8] {
@@ -34,19 +34,89 @@ fn tuple_items(tuple_expr: Expr) -> Result<Vec<Expr>, EvalError> {
     }
 }
 
-fn write_tuple_from_items(sink: &mut ExprSink, items: &[Expr]) -> Result<(), EvalError> {
-    sink.write(SourceItem::Tag(Tag::Arity(items.len() as u8)))?;
-    for e in items {
-        sink.extend_from_slice(expr_span(*e))?;
+fn write_normalized_expr(sink: &mut ExprSink, mut bytes: Vec<u8>) -> Result<(), EvalError> {
+    let mut out = vec![0u8; bytes.len()];
+    let mut ez = ExprZipper::new(Expr {
+        ptr: bytes.as_mut_ptr(),
+    });
+    let mut oz = ExprZipper::new(Expr {
+        ptr: out.as_mut_ptr(),
+    });
+    let mut var_map = [None; 64];
+    let mut input_new_vars = 0usize;
+    let mut output_new_vars = 0u8;
+
+    loop {
+        match ez.tag() {
+            Tag::NewVar => {
+                if input_new_vars >= var_map.len() {
+                    return Err(EvalError::from("too many variables in expression"));
+                }
+                if output_new_vars >= 64 {
+                    return Err(EvalError::from("too many variables in expression"));
+                }
+
+                var_map[input_new_vars] = Some(output_new_vars);
+                oz.write_new_var();
+                oz.loc += 1;
+                input_new_vars += 1;
+                output_new_vars += 1;
+            }
+            Tag::VarRef(i) => {
+                let mapped = match var_map[i as usize] {
+                    Some(mapped) => mapped,
+                    None => {
+                        if output_new_vars >= 64 {
+                            return Err(EvalError::from("too many variables in expression"));
+                        }
+
+                        let mapped = output_new_vars;
+                        var_map[i as usize] = Some(mapped);
+                        output_new_vars += 1;
+                        oz.write_new_var();
+                        oz.loc += 1;
+                        if !ez.next() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+
+                oz.write_var_ref(mapped);
+                oz.loc += 1;
+            }
+            Tag::SymbolSize(s) => {
+                let symbol = unsafe {
+                    std::slice::from_raw_parts(ez.root.ptr.byte_add(ez.loc), s as usize + 1)
+                };
+                oz.write_move(symbol);
+            }
+            Tag::Arity(_) => {
+                unsafe {
+                    *oz.root.ptr.byte_add(oz.loc) = *ez.root.ptr.byte_add(ez.loc);
+                }
+                oz.loc += 1;
+            }
+        }
+
+        if !ez.next() {
+            break;
+        }
     }
+
+    sink.extend_from_slice(&out[..oz.loc])?;
     Ok(())
 }
 
-fn write_tuple_header(sink: &mut ExprSink, len: usize) -> Result<(), EvalError> {
-    if len > u8::MAX as usize {
+fn push_tuple_from_items(out: &mut Vec<u8>, items: &[Expr]) -> Result<(), EvalError> {
+    if items.len() > u8::MAX as usize {
         return Err(EvalError::from("tuple arity exceeds 255"));
     }
-    sink.write(SourceItem::Tag(Tag::Arity(len as u8)))?;
+
+    out.push(item_byte(Tag::Arity(items.len() as u8)));
+    for e in items {
+        out.extend_from_slice(expr_span(*e));
+    }
     Ok(())
 }
 
@@ -145,6 +215,14 @@ fn write_indices_as_vars(e: Expr, sink: &mut ExprSink, introduced: &mut u8) -> R
     }
 
     Ok(())
+fn write_expr(sink: &mut ExprSink, expr: Expr) -> Result<(), EvalError> {
+    write_normalized_expr(sink, expr_span(expr).to_vec())
+}
+
+fn write_tuple_from_items(sink: &mut ExprSink, items: &[Expr]) -> Result<(), EvalError> {
+    let mut out = Vec::new();
+    push_tuple_from_items(&mut out, items)?;
+    write_normalized_expr(sink, out)
 }
 
 fn partition_key(partition: &[Vec<Expr>]) -> Vec<Vec<Vec<u8>>> {
@@ -185,14 +263,55 @@ fn build_partitions(
 }
 
 fn write_partitions(sink: &mut ExprSink, partitions: &[Vec<Vec<Expr>>]) -> Result<(), EvalError> {
-    write_tuple_header(sink, partitions.len())?;
+    if partitions.len() > u8::MAX as usize {
+        return Err(EvalError::from("tuple arity exceeds 255"));
+    }
+
+    let mut out = Vec::new();
+    out.push(item_byte(Tag::Arity(partitions.len() as u8)));
     for partition in partitions {
-        write_tuple_header(sink, partition.len())?;
+        if partition.len() > u8::MAX as usize {
+            return Err(EvalError::from("tuple arity exceeds 255"));
+        }
+
+        out.push(item_byte(Tag::Arity(partition.len() as u8)));
         for block in partition {
-            write_tuple_from_items(sink, block)?;
+            push_tuple_from_items(&mut out, block)?;
         }
     }
-    Ok(())
+
+    write_normalized_expr(sink, out)
+}
+
+fn factorial_i64(n: i64) -> Result<i64, EvalError> {
+    if n < 0 {
+        return Err(EvalError::from("factorial expects n >= 0"));
+    }
+
+    let mut result = 1i64;
+    for i in 2..=n {
+        result = result
+            .checked_mul(i)
+            .ok_or_else(|| EvalError::from("factorial overflow"))?;
+    }
+    Ok(result)
+}
+
+fn falling_factorial_i64(n: i64, k: i64) -> Result<i64, EvalError> {
+    if n < 0 || k < 0 {
+        return Err(EvalError::from("falling_factorial expects n >= 0 and k >= 0"));
+    }
+    if k > n {
+        return Err(EvalError::from("falling_factorial expects k <= n"));
+    }
+
+    let mut result = 1i64;
+    for i in 0..k {
+        result = result
+            .checked_mul(n - i)
+            .ok_or_else(|| EvalError::from("falling_factorial overflow"))?;
+    }
+    Ok(result)
 }
 
 pub extern "C" fn length(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
@@ -215,8 +334,7 @@ pub extern "C" fn car(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), 
         return Err(EvalError::from("car on empty tuple"));
     }
 
-    sink.extend_from_slice(expr_span(items[0]))?;
-    Ok(())
+    write_expr(sink, items[0])
 }
 
 pub extern "C" fn cdr(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
@@ -239,12 +357,14 @@ pub extern "C" fn cons(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(),
     let (head, tail_tuple) = consume_named_expr_2(expr, b"cons")?;
     let tail_items = tuple_items(tail_tuple)?;
 
-    sink.write(SourceItem::Tag(Tag::Arity((tail_items.len() + 1) as u8)))?;
-    sink.extend_from_slice(expr_span(head))?;
-    for e in &tail_items {
-        sink.extend_from_slice(expr_span(*e))?;
+    if tail_items.len() == u8::MAX as usize {
+        return Err(EvalError::from("tuple arity exceeds 255"));
     }
-    Ok(())
+
+    let mut items = Vec::with_capacity(tail_items.len() + 1);
+    items.push(head);
+    items.extend(tail_items);
+    write_tuple_from_items(sink, &items)
 }
 
 pub extern "C" fn decons(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
@@ -257,10 +377,11 @@ pub extern "C" fn decons(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(
         return Err(EvalError::from("decons on empty tuple"));
     }
 
-    sink.write(SourceItem::Tag(Tag::Arity(2)))?;
-    sink.extend_from_slice(expr_span(items[0]))?;
-    write_tuple_from_items(sink, &items[1..])?;
-    Ok(())
+    let mut out = Vec::new();
+    out.push(item_byte(Tag::Arity(2)));
+    out.extend_from_slice(expr_span(items[0]));
+    push_tuple_from_items(&mut out, &items[1..])?;
+    write_normalized_expr(sink, out)
 }
 
 pub extern "C" fn partitions(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
@@ -337,6 +458,43 @@ pub extern "C" fn indices_to_vars(expr: *mut ExprSource, sink: *mut ExprSink) ->
     let e = consume_named_expr_1(expr, b"indices_to_vars")?;
     let mut introduced = 0u8;
     write_indices_as_vars(e, sink, &mut introduced)
+pub extern "C" fn freshen_pattern(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
+    let expr = unsafe { &mut *expr };
+    let sink = unsafe { &mut *sink };
+
+    let pattern = consume_named_expr_1(expr, b"freshen-pattern")?;
+    write_expr(sink, pattern)
+}
+
+pub extern "C" fn factorial(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
+    let expr = unsafe { &mut *expr };
+    let sink = unsafe { &mut *sink };
+
+    let items = expr.consume_head_check(b"factorial")?;
+    if items != 1 {
+        return Err(EvalError::from("factorial takes one argument"));
+    }
+
+    let n = expr.consume::<i64>()?;
+    let result = factorial_i64(n)?;
+    sink.write(SourceItem::Symbol(result.to_be_bytes()[..].into()))?;
+    Ok(())
+}
+
+pub extern "C" fn falling_factorial(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
+    let expr = unsafe { &mut *expr };
+    let sink = unsafe { &mut *sink };
+
+    let items = expr.consume_head_check(b"falling_factorial")?;
+    if items != 2 {
+        return Err(EvalError::from("falling_factorial takes two arguments"));
+    }
+
+    let n = expr.consume::<i64>()?;
+    let k = expr.consume::<i64>()?;
+    let result = falling_factorial_i64(n, k)?;
+    sink.write(SourceItem::Symbol(result.to_be_bytes()[..].into()))?;
+    Ok(())
 }
 
 pub fn register(scope: &mut EvalScope) {
@@ -349,4 +507,7 @@ pub fn register(scope: &mut EvalScope) {
     scope.add_func("is_var", is_var, FuncType::Pure);
     scope.add_func("vars_to_indices", vars_to_indices, FuncType::Pure);
     scope.add_func("indices_to_vars", indices_to_vars, FuncType::Pure);
+    scope.add_func("freshen-pattern", freshen_pattern, FuncType::Pure);
+    scope.add_func("factorial", factorial, FuncType::Pure);
+    scope.add_func("falling_factorial", falling_factorial, FuncType::Pure);
 }
