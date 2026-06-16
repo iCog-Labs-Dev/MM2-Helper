@@ -215,6 +215,7 @@ fn write_indices_as_vars(e: Expr, sink: &mut ExprSink, introduced: &mut u8) -> R
     }
 
     Ok(())
+}
 fn write_expr(sink: &mut ExprSink, expr: Expr) -> Result<(), EvalError> {
     write_normalized_expr(sink, expr_span(expr).to_vec())
 }
@@ -458,6 +459,7 @@ pub extern "C" fn indices_to_vars(expr: *mut ExprSource, sink: *mut ExprSink) ->
     let e = consume_named_expr_1(expr, b"indices_to_vars")?;
     let mut introduced = 0u8;
     write_indices_as_vars(e, sink, &mut introduced)
+}
 pub extern "C" fn freshen_pattern(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
     let expr = unsafe { &mut *expr };
     let sink = unsafe { &mut *sink };
