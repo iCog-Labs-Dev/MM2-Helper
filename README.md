@@ -4,14 +4,18 @@ Helper extension package for MORK grounding functions.
 
 Current helpers included:
 
-- `length`
-- `car`
-- `cdr`
-- `cons`
-- `decons`
 - `partitions`
+- `is_var`
+- `vars_to_indices`
+- `indices_to_vars`
+- `freshen-pattern`
 - `factorial`
 - `falling_factorial`
+
+Tuple/list helpers such as `length`, `car`, `cdr`, `cons`, and `decons`
+are intentionally not implemented here anymore. They are provided by
+[`mm2-stdlib`](https://github.com/abnsol/mm2-stdlib), so install/register
+`mm2-stdlib` alongside this package when your MM2 code uses those functions.
 
 Example:
 
