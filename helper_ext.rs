@@ -362,6 +362,7 @@ pub extern "C" fn indices_to_vars(expr: *mut ExprSource, sink: *mut ExprSink) ->
     let mut labels = HashMap::new();
     let mut introduced = 0u8;
     write_indices_as_vars(e, sink, &mut labels, &mut introduced)
+}
 pub extern "C" fn freshen_pattern(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
     let expr = unsafe { &mut *expr };
     let sink = unsafe { &mut *sink };
