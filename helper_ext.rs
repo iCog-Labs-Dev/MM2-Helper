@@ -1,7 +1,7 @@
 use eval::{EvalScope, FuncType};
 use eval_ffi::{EvalError, ExprSink, ExprSource, Tag};
 use mork_expr::{item_byte, Expr, ExprEnv, ExprZipper, SourceItem};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 fn expr_span(e: Expr) -> &'static [u8] {
     unsafe { e.span().as_ref().unwrap() }
@@ -112,6 +112,7 @@ fn push_tuple_from_items(out: &mut Vec<u8>, items: &[Expr]) -> Result<(), EvalEr
     Ok(())
 }
 
+
 fn write_var_marker(sink: &mut ExprSink, index: usize) -> Result<(), EvalError> {
     let index = index.to_string();
     sink.write(SourceItem::Tag(Tag::Arity(2)))?;
@@ -120,26 +121,7 @@ fn write_var_marker(sink: &mut ExprSink, index: usize) -> Result<(), EvalError> 
     Ok(())
 }
 
-fn parse_var_marker_index(symbol: &[u8]) -> Result<u8, EvalError> {
-    if symbol.is_empty() {
-        return Err(EvalError::from("var marker index can not be empty"));
-    }
-
-    let mut index = 0u16;
-    for &b in symbol {
-        if !b.is_ascii_digit() {
-            return Err(EvalError::from("var marker index must be decimal digits"));
-        }
-        index = index * 10 + (b - b'0') as u16;
-        if index >= 64 {
-            return Err(EvalError::from("var marker index must be less than 64"));
-        }
-    }
-
-    Ok(index as u8)
-}
-
-fn var_marker_index(e: Expr) -> Result<Option<u8>, EvalError> {
+fn var_marker_key(e: Expr) -> Result<Option<Vec<u8>>, EvalError> {
     unsafe {
         let Tag::Arity(2) = mork_expr::byte_item(*e.ptr) else {
             return Ok(None);
@@ -156,24 +138,28 @@ fn var_marker_index(e: Expr) -> Result<Option<u8>, EvalError> {
         }
         offset += head_len as usize;
 
-        let Tag::SymbolSize(index_len) = mork_expr::byte_item(*e.ptr.add(offset)) else {
-            return Err(EvalError::from("var marker index must be a symbol"));
-        };
-        offset += 1;
-        let index = std::slice::from_raw_parts(e.ptr.add(offset), index_len as usize);
-        Ok(Some(parse_var_marker_index(index)?))
+        let key = Expr { ptr: e.ptr.add(offset) };
+        Ok(Some(expr_span(key).to_vec()))
     }
 }
 
-fn write_indices_as_vars(e: Expr, sink: &mut ExprSink, introduced: &mut u8) -> Result<(), EvalError> {
-    if let Some(index) = var_marker_index(e)? {
-        if index == *introduced {
+fn write_indices_as_vars(
+    e: Expr,
+    sink: &mut ExprSink,
+    labels: &mut HashMap<Vec<u8>, u8>,
+    introduced: &mut u8,
+) -> Result<(), EvalError> {
+    if let Some(key) = var_marker_key(e)? {
+        if let Some(index) = labels.get(&key) {
+            sink.write(SourceItem::Tag(Tag::VarRef(*index)))?;
+        } else {
+            if *introduced >= 64 {
+                return Err(EvalError::from("can only introduce up to 64 variables"));
+            }
+            let index = *introduced;
+            labels.insert(key, index);
             sink.write(SourceItem::Tag(Tag::NewVar))?;
             *introduced += 1;
-        } else if index < *introduced {
-            sink.write(SourceItem::Tag(Tag::VarRef(index)))?;
-        } else {
-            return Err(EvalError::from("var marker index appears before its introduction"));
         }
         return Ok(());
     }
@@ -199,7 +185,7 @@ fn write_indices_as_vars(e: Expr, sink: &mut ExprSink, introduced: &mut u8) -> R
                 let mut offset = 1usize;
                 for _ in 0..arity {
                     let child = Expr { ptr: e.ptr.add(offset) };
-                    write_indices_as_vars(child, sink, introduced)?;
+                    write_indices_as_vars(child, sink, labels, introduced)?;
                     offset += expr_span(child).len();
                 }
             }
@@ -315,7 +301,7 @@ pub extern "C" fn partitions(expr: *mut ExprSource, sink: *mut ExprSink) -> Resu
 
 fn expr_is_var(e: Expr) -> Result<bool, EvalError> {
     let raw_var = matches!(unsafe { mork_expr::byte_item(*e.ptr) }, Tag::NewVar | Tag::VarRef(_));
-    Ok(raw_var || var_marker_index(e)?.is_some())
+    Ok(raw_var || var_marker_key(e)?.is_some())
 }
 
 pub extern "C" fn is_var(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
@@ -373,9 +359,9 @@ pub extern "C" fn indices_to_vars(expr: *mut ExprSource, sink: *mut ExprSink) ->
     let sink = unsafe { &mut *sink };
 
     let e = consume_named_expr_1(expr, b"indices_to_vars")?;
+    let mut labels = HashMap::new();
     let mut introduced = 0u8;
-    write_indices_as_vars(e, sink, &mut introduced)
-}
+    write_indices_as_vars(e, sink, &mut labels, &mut introduced)
 pub extern "C" fn freshen_pattern(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
     let expr = unsafe { &mut *expr };
     let sink = unsafe { &mut *sink };

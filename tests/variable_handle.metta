@@ -1,5 +1,5 @@
-(myexpr (foo $x $x (bar $y)))
-
+; (myexpr (foo $x $z (bar $y $n $l $p)))
+(indexed (foo (var (0 arg/0)) (var (0 arg/1)) (bar (var (0 0)) (var (1 0)) (var 00) (var 0))))
 (exec 0
   (, (myexpr $e))
   (O (pure (indexed $out) $out
