@@ -4,14 +4,18 @@ Helper extension package for MORK grounding functions.
 
 Current helpers included:
 
-- `length`
-- `car`
-- `cdr`
-- `cons`
-- `decons`
 - `partitions`
+- `is_var`
+- `vars_to_indices`
+- `indices_to_vars`
+- `freshen-pattern`
 - `factorial`
 - `falling_factorial`
+
+Tuple/list helpers such as `length`, `car`, `cdr`, `cons`, and `decons`
+are intentionally not implemented here anymore. They are provided by
+[`mm2-stdlib`](https://github.com/abnsol/mm2-stdlib), so install/register
+`mm2-stdlib` alongside this package when your MM2 code uses those functions.
 
 Example:
 
@@ -39,6 +43,7 @@ This package applies a small patch to a MORK checkout:
 1. Copies `helper_ext.rs` into `kernel/src/helper_ext.rs`
 2. Wires module/import/registration in kernel sources
 3. Builds MORK release binary
+4. Installs a user-level `mork` launcher so the binary can be run without an absolute path
 
 ## Requirements
 
@@ -57,11 +62,17 @@ bash setup_mork_helper_ext.sh /absolute/path/to/MORK
 ```
 
 If `/absolute/path/to/MORK` does not exist, the script clones upstream MORK there automatically.
+It also ensures a sibling `PathMap` checkout exists in the same parent directory as your chosen MORK path, cloning `https://github.com/Adam-Vandervorst/PathMap.git` when needed.
+
+After the build, the script installs a `mork` launcher into a user-writable bin directory.
+It uses `~/.local/bin`.
+If needed, it appends that directory to `PATH` in your common bash and zsh startup files.
+If `mork` already exists there and points somewhere else, the script stops instead of replacing it.
 
 ## Run MORK
 
 ```bash
-/absolute/path/to/MORK/target/release/mork run your_file.metta
+mork run your_file.metta
 ```
 
 ## Re-run after updates

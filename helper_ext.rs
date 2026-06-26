@@ -15,14 +15,6 @@ fn consume_named_expr_1(expr: &mut ExprSource, name: &[u8]) -> Result<Expr, Eval
     expr.consume::<Expr>()
 }
 
-fn consume_named_expr_2(expr: &mut ExprSource, name: &[u8]) -> Result<(Expr, Expr), EvalError> {
-    let items = expr.consume_head_check(name)?;
-    if items != 2 {
-        return Err(EvalError::from("takes two arguments"));
-    }
-    Ok((expr.consume::<Expr>()?, expr.consume::<Expr>()?))
-}
-
 fn tuple_items(tuple_expr: Expr) -> Result<Vec<Expr>, EvalError> {
     match mork_expr::byte_item(unsafe { *tuple_expr.ptr }) {
         Tag::Arity(_) => {
@@ -201,14 +193,9 @@ fn write_indices_as_vars(
     }
 
     Ok(())
+}
 fn write_expr(sink: &mut ExprSink, expr: Expr) -> Result<(), EvalError> {
     write_normalized_expr(sink, expr_span(expr).to_vec())
-}
-
-fn write_tuple_from_items(sink: &mut ExprSink, items: &[Expr]) -> Result<(), EvalError> {
-    let mut out = Vec::new();
-    push_tuple_from_items(&mut out, items)?;
-    write_normalized_expr(sink, out)
 }
 
 fn partition_key(partition: &[Vec<Expr>]) -> Vec<Vec<Vec<u8>>> {
@@ -298,77 +285,6 @@ fn falling_factorial_i64(n: i64, k: i64) -> Result<i64, EvalError> {
             .ok_or_else(|| EvalError::from("falling_factorial overflow"))?;
     }
     Ok(result)
-}
-
-pub extern "C" fn length(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
-    let expr = unsafe { &mut *expr };
-    let sink = unsafe { &mut *sink };
-
-    let tuple_expr = consume_named_expr_1(expr, b"length")?;
-    let n = tuple_items(tuple_expr)?.len() as i64;
-    sink.write(SourceItem::Symbol(n.to_be_bytes()[..].into()))?;
-    Ok(())
-}
-
-pub extern "C" fn car(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
-    let expr = unsafe { &mut *expr };
-    let sink = unsafe { &mut *sink };
-
-    let tuple_expr = consume_named_expr_1(expr, b"car")?;
-    let items = tuple_items(tuple_expr)?;
-    if items.is_empty() {
-        return Err(EvalError::from("car on empty tuple"));
-    }
-
-    write_expr(sink, items[0])
-}
-
-pub extern "C" fn cdr(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
-    let expr = unsafe { &mut *expr };
-    let sink = unsafe { &mut *sink };
-
-    let tuple_expr = consume_named_expr_1(expr, b"cdr")?;
-    let items = tuple_items(tuple_expr)?;
-    if items.is_empty() {
-        return Err(EvalError::from("cdr on empty tuple"));
-    }
-
-    write_tuple_from_items(sink, &items[1..])
-}
-
-pub extern "C" fn cons(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
-    let expr = unsafe { &mut *expr };
-    let sink = unsafe { &mut *sink };
-
-    let (head, tail_tuple) = consume_named_expr_2(expr, b"cons")?;
-    let tail_items = tuple_items(tail_tuple)?;
-
-    if tail_items.len() == u8::MAX as usize {
-        return Err(EvalError::from("tuple arity exceeds 255"));
-    }
-
-    let mut items = Vec::with_capacity(tail_items.len() + 1);
-    items.push(head);
-    items.extend(tail_items);
-    write_tuple_from_items(sink, &items)
-}
-
-
-pub extern "C" fn decons(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
-    let expr = unsafe { &mut *expr };
-    let sink = unsafe { &mut *sink };
-
-    let tuple_expr = consume_named_expr_1(expr, b"decons")?;
-    let items = tuple_items(tuple_expr)?;
-    if items.is_empty() {
-        return Err(EvalError::from("decons on empty tuple"));
-    }
-
-    let mut out = Vec::new();
-    out.push(item_byte(Tag::Arity(2)));
-    out.extend_from_slice(expr_span(items[0]));
-    push_tuple_from_items(&mut out, &items[1..])?;
-    write_normalized_expr(sink, out)
 }
 
 pub extern "C" fn partitions(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
@@ -486,11 +402,6 @@ pub extern "C" fn falling_factorial(expr: *mut ExprSource, sink: *mut ExprSink) 
 }
 
 pub fn register(scope: &mut EvalScope) {
-    scope.add_func("length", length, FuncType::Pure);
-    scope.add_func("car", car, FuncType::Pure);
-    scope.add_func("cdr", cdr, FuncType::Pure);
-    scope.add_func("cons", cons, FuncType::Pure);
-    scope.add_func("decons", decons, FuncType::Pure);
     scope.add_func("partitions", partitions, FuncType::Pure);
     scope.add_func("is_var", is_var, FuncType::Pure);
     scope.add_func("vars_to_indices", vars_to_indices, FuncType::Pure);

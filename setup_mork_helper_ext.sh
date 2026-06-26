@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 UPSTREAM_URL="${MORK_UPSTREAM_URL:-https://github.com/trueagi-io/MORK}"
+PATHMAP_URL="https://github.com/Adam-Vandervorst/PathMap.git"
 HELPER_EXT_SRC="$SCRIPT_DIR/helper_ext.rs"
 
 if [[ $# -lt 1 ]]; then
@@ -10,7 +11,12 @@ if [[ $# -lt 1 ]]; then
   exit 1
 fi
 
-MORK_DIR="$1"
+# Normalize the requested MORK path so sibling paths are computed consistently.
+MORK_INPUT="${1%/}"
+mkdir -p "$(dirname "$MORK_INPUT")"
+PARENT_DIR="$(cd "$(dirname "$MORK_INPUT")" && pwd)"
+MORK_DIR="$PARENT_DIR/$(basename "$MORK_INPUT")"
+PATHMAP_DIR="$PARENT_DIR/PathMap"
 
 if [[ ! -f "$HELPER_EXT_SRC" ]]; then
   echo "ERROR: helper_ext.rs not found at $HELPER_EXT_SRC" >&2
@@ -19,8 +25,13 @@ fi
 
 if [[ ! -d "$MORK_DIR/.git" ]]; then
   echo "MORK repo not found at $MORK_DIR. Cloning from $UPSTREAM_URL ..."
-  mkdir -p "$(dirname "$MORK_DIR")"
   git clone "$UPSTREAM_URL" "$MORK_DIR"
+fi
+
+# PathMap is expected to live beside the chosen MORK checkout.
+if [[ ! -d "$PATHMAP_DIR/.git" ]]; then
+  echo "PathMap repo not found at $PATHMAP_DIR. Cloning from $PATHMAP_URL ..."
+  git clone "$PATHMAP_URL" "$PATHMAP_DIR"
 fi
 
 LIB_RS="$MORK_DIR/kernel/src/lib.rs"
@@ -78,6 +89,52 @@ echo "Building MORK ..."
   RUSTFLAGS="-C target-cpu=native" cargo build --release
 )
 
+# Cargo output location can vary depending on the workspace layout.
+MORK_BIN="$MORK_DIR/kernel/target/release/mork"
+if [[ ! -x "$MORK_BIN" ]]; then
+  MORK_BIN="$MORK_DIR/target/release/mork"
+fi
+
+if [[ ! -x "$MORK_BIN" ]]; then
+  echo "ERROR: could not locate the built mork binary." >&2
+  exit 1
+fi
+
+MORK_BIN_DIR="$HOME/.local/bin"
+mkdir -p "$MORK_BIN_DIR"
+MORK_BIN_DIR="$(cd "$MORK_BIN_DIR" && pwd)"
+
+# Refuse to overwrite an unrelated existing mork command.
+if [[ -L "$MORK_BIN_DIR/mork" && "$(readlink "$MORK_BIN_DIR/mork")" != "$MORK_BIN" ]]; then
+  echo "ERROR: $MORK_BIN_DIR/mork already exists and points somewhere else." >&2
+  echo "Remove it and re-run." >&2
+  exit 1
+fi
+
+if [[ -e "$MORK_BIN_DIR/mork" && ! -L "$MORK_BIN_DIR/mork" ]]; then
+  echo "ERROR: $MORK_BIN_DIR/mork already exists and is not a symlink." >&2
+  echo "Remove it and re-run." >&2
+  exit 1
+fi
+
+rm -f "$MORK_BIN_DIR/mork"
+ln -s "$MORK_BIN" "$MORK_BIN_DIR/mork"
+
+# Make the user-level bin directory available in future shells if needed.
+if [[ ":$PATH:" != *":$MORK_BIN_DIR:"* ]]; then
+  PATH_LINE="export PATH=\"$MORK_BIN_DIR:\$PATH\""
+  for rc in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zshrc" "$HOME/.zprofile"; do
+    touch "$rc"
+    grep -Fqx "$PATH_LINE" "$rc" || printf '\n%s\n' "$PATH_LINE" >> "$rc"
+  done
+fi
+
 echo
 echo "Done."
-echo "Binary: $MORK_DIR/target/release/mork"
+echo "Binary: $MORK_BIN"
+echo "Command: $MORK_BIN_DIR/mork"
+if [[ ":$PATH:" != *":$MORK_BIN_DIR:"* ]]; then
+  echo "Open a new shell before running mork."
+else
+  echo "You can now run mork from anywhere using: mork --help"
+fi
