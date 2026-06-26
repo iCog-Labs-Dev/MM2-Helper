@@ -10,7 +10,26 @@ Current helpers included:
 - `cons`
 - `decons`
 - `partitions`
+- `factorial`
+- `falling_factorial`
 
+Example:
+
+```lisp
+(pure (factorial-result $out) $out
+  (i64_to_string (factorial (i64_from_string 5))))
+```
+
+Safe binomial-style usage:
+
+```lisp
+;; C(n,k) = falling_factorial(n,k) / factorial(k)
+(pure (choose-result $out) $out
+  (i64_to_string
+    (div_i64
+      (falling_factorial (i64_from_string 25) (i64_from_string 3))
+      (factorial (i64_from_string 3)))))
+```
 
 
 ## What this package does
