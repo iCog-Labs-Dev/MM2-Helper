@@ -373,6 +373,148 @@ fn falling_factorial_i64(n: i64, k: i64) -> Result<i64, EvalError> {
     Ok(result)
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum PatternVarKey {
+    Raw(usize),
+    Marker(Vec<u8>),
+}
+
+struct SubsumesState {
+    raw_new_vars: usize,
+    bindings: HashMap<PatternVarKey, Vec<u8>>,
+}
+
+impl SubsumesState {
+    fn new() -> Self {
+        Self {
+            raw_new_vars: 0,
+            bindings: HashMap::new(),
+        }
+    }
+
+    fn raw_key(&mut self, tag: Tag) -> Option<PatternVarKey> {
+        match tag {
+            Tag::NewVar => {
+                let key = PatternVarKey::Raw(self.raw_new_vars);
+                self.raw_new_vars += 1;
+                Some(key)
+            }
+            Tag::VarRef(i) => Some(PatternVarKey::Raw(i as usize)),
+            _ => None,
+        }
+    }
+
+    fn bind_or_compare(&mut self, key: PatternVarKey, target: Expr) -> bool {
+        let target_span = expr_span(target);
+        if let Some(bound) = self.bindings.get(&key) {
+            bound.as_slice() == target_span
+        } else {
+            self.bindings.insert(key, target_span.to_vec());
+            true
+        }
+    }
+}
+
+fn subsumes_expr(pattern: Expr, target: Expr, state: &mut SubsumesState) -> Result<bool, EvalError> {
+    if let Some(key) = var_marker_key(pattern)? {
+        return Ok(state.bind_or_compare(PatternVarKey::Marker(key), target));
+    }
+
+    unsafe {
+        let pattern_tag = mork_expr::byte_item(*pattern.ptr);
+        if let Some(key) = state.raw_key(pattern_tag) {
+            return Ok(state.bind_or_compare(key, target));
+        }
+
+        match (pattern_tag, mork_expr::byte_item(*target.ptr)) {
+            (Tag::SymbolSize(pattern_size), Tag::SymbolSize(target_size)) => {
+                if pattern_size != target_size {
+                    return Ok(false);
+                }
+
+                let pattern_symbol = std::slice::from_raw_parts(pattern.ptr.add(1), pattern_size as usize);
+                let target_symbol = std::slice::from_raw_parts(target.ptr.add(1), target_size as usize);
+                Ok(pattern_symbol == target_symbol)
+            }
+            (Tag::Arity(pattern_arity), Tag::Arity(target_arity)) => {
+                if pattern_arity != target_arity {
+                    return Ok(false);
+                }
+
+                let mut pattern_offset = 1usize;
+                let mut target_offset = 1usize;
+                for _ in 0..pattern_arity {
+                    let pattern_child = Expr {
+                        ptr: pattern.ptr.add(pattern_offset),
+                    };
+                    let target_child = Expr {
+                        ptr: target.ptr.add(target_offset),
+                    };
+
+                    if !subsumes_expr(pattern_child, target_child, state)? {
+                        return Ok(false);
+                    }
+
+                    pattern_offset += expr_span(pattern_child).len();
+                    target_offset += expr_span(target_child).len();
+                }
+
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+}
+
+fn strictly_subsumes_expr(pattern: Expr, target: Expr) -> Result<bool, EvalError> {
+    let mut forward_state = SubsumesState::new();
+    if !subsumes_expr(pattern, target, &mut forward_state)? {
+        return Ok(false);
+    }
+
+    let mut reverse_state = SubsumesState::new();
+    Ok(!subsumes_expr(target, pattern, &mut reverse_state)?)
+}
+
+fn is_subsumed_by_expr(pattern: Expr, other: Expr) -> Result<bool, EvalError> {
+    let mut state = SubsumesState::new();
+    subsumes_expr(other, pattern, &mut state)
+}
+
+fn is_strictly_subsumed_by_expr(pattern: Expr, other: Expr) -> Result<bool, EvalError> {
+    strictly_subsumes_expr(other, pattern)
+}
+
+fn not_subsumed_expr(pattern: Expr, other: Expr) -> Result<bool, EvalError> {
+    Ok(!is_strictly_subsumed_by_expr(pattern, other)?)
+}
+
+fn subsumes_args(expr: &mut ExprSource, name: &[u8]) -> Result<(Expr, Expr), EvalError> {
+    let items = expr.consume_head_check(name)?;
+    match items {
+        1 => {
+            let pair = expr.consume::<Expr>()?;
+            let pair_items = tuple_items(pair)?;
+            if pair_items.len() != 2 {
+                return Err(EvalError::from("subsumes pair must be (pattern target)"));
+            }
+            Ok((pair_items[0], pair_items[1]))
+        }
+        2 => {
+            let target = expr.consume::<Expr>()?;
+            let pattern = expr.consume::<Expr>()?;
+            Ok((pattern, target))
+        }
+        _ => Err(EvalError::from("subsumes takes either one pair or two arguments")),
+    }
+}
+
+fn write_bool(sink: &mut ExprSink, value: bool) -> Result<(), EvalError> {
+    let value = [u8::from(value)];
+    sink.write(SourceItem::Symbol(&value))?;
+    Ok(())
+}
+
 pub extern "C" fn partitions(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
     let expr = unsafe { &mut *expr };
     let sink = unsafe { &mut *sink };
@@ -478,6 +620,38 @@ pub extern "C" fn substitute(expr: *mut ExprSource, sink: *mut ExprSink) -> Resu
     write_substituted_expr(pattern, sink, &values, &mut state)
 }
 
+pub extern "C" fn subsumes(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
+    let expr = unsafe { &mut *expr };
+    let sink = unsafe { &mut *sink };
+
+    let (pattern, target) = subsumes_args(expr, b"subsumes")?;
+    write_bool(sink, strictly_subsumes_expr(pattern, target)?)
+}
+
+pub extern "C" fn can_unify(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
+    let expr = unsafe { &mut *expr };
+    let sink = unsafe { &mut *sink };
+
+    let (pattern, target) = subsumes_args(expr, b"can_unify")?;
+    write_bool(sink, strictly_subsumes_expr(pattern, target)?)
+}
+
+pub extern "C" fn subsumed_by(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
+    let expr = unsafe { &mut *expr };
+    let sink = unsafe { &mut *sink };
+
+    let (pattern, other) = subsumes_args(expr, b"subsumed_by")?;
+    write_bool(sink, is_subsumed_by_expr(pattern, other)?)
+}
+
+pub extern "C" fn not_subsumed(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
+    let expr = unsafe { &mut *expr };
+    let sink = unsafe { &mut *sink };
+
+    let (pattern, other) = subsumes_args(expr, b"not_subsumed")?;
+    write_bool(sink, not_subsumed_expr(pattern, other)?)
+}
+
 pub extern "C" fn freshen_pattern(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
     let expr = unsafe { &mut *expr };
     let sink = unsafe { &mut *sink };
@@ -525,6 +699,10 @@ pub fn register(scope: &mut EvalScope) {
     scope.add_func("vars_to_indices", vars_to_indices, FuncType::Pure);
     scope.add_func("indices_to_vars", indices_to_vars, FuncType::Pure);
     scope.add_func("substitute", substitute, FuncType::Pure);
+    scope.add_func("subsumes", subsumes, FuncType::Pure);
+    scope.add_func("can_unify", can_unify, FuncType::Pure);
+    scope.add_func("subsumed_by", subsumed_by, FuncType::Pure);
+    scope.add_func("not_subsumed", not_subsumed, FuncType::Pure);
     scope.add_func("freshen-pattern", freshen_pattern, FuncType::Pure);
     scope.add_func("factorial", factorial, FuncType::Pure);
     scope.add_func("falling_factorial", falling_factorial, FuncType::Pure);
