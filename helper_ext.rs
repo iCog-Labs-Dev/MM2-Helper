@@ -849,38 +849,6 @@ pub extern "C" fn not_subsumed(expr: *mut ExprSource, sink: *mut ExprSink) -> Re
     write_bool(sink, not_subsumed_expr(pattern, other)?)
 }
 
-pub extern "C" fn subsumes(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
-    let expr = unsafe { &mut *expr };
-    let sink = unsafe { &mut *sink };
-
-    let (pattern, target) = subsumes_args(expr, b"subsumes")?;
-    write_bool(sink, strictly_subsumes_expr(pattern, target)?)
-}
-
-pub extern "C" fn can_unify(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
-    let expr = unsafe { &mut *expr };
-    let sink = unsafe { &mut *sink };
-
-    let (pattern, target) = subsumes_args(expr, b"can_unify")?;
-    write_bool(sink, strictly_subsumes_expr(pattern, target)?)
-}
-
-pub extern "C" fn subsumed_by(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
-    let expr = unsafe { &mut *expr };
-    let sink = unsafe { &mut *sink };
-
-    let (pattern, other) = subsumes_args(expr, b"subsumed_by")?;
-    write_bool(sink, is_subsumed_by_expr(pattern, other)?)
-}
-
-pub extern "C" fn not_subsumed(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
-    let expr = unsafe { &mut *expr };
-    let sink = unsafe { &mut *sink };
-
-    let (pattern, other) = subsumes_args(expr, b"not_subsumed")?;
-    write_bool(sink, not_subsumed_expr(pattern, other)?)
-}
-
 pub extern "C" fn freshen_pattern(
     expr: *mut ExprSource,
     sink: *mut ExprSink,
