@@ -1,6 +1,8 @@
 use eval::{EvalScope, FuncType};
 use eval_ffi::{EvalError, ExprSink, ExprSource, Tag};
 use mork_expr::{item_byte, Expr, ExprEnv, ExprZipper, SourceItem};
+use crate::sinks::{Sink, WriteResource, WriteResourceRequest};
+use pathmap::zipper::{WriteZipperTracked, ZipperAbsolutePath, ZipperMoving, ZipperWriting};
 use std::collections::{HashMap, HashSet};
 
 fn expr_span(e: Expr) -> &'static [u8] {
@@ -736,6 +738,158 @@ pub extern "C" fn beta_cdf_f64(
     let result = regularized_beta_cdf(alpha, beta, x)?;
     sink.write(SourceItem::Symbol(result.to_be_bytes()[..].into()))?;
     Ok(())
+}
+
+// Counts complete support assignments without retaining their bindings.
+// MM2-Helper's installer wires this into MORK's sink dispatcher as
+// `(count-fast <output> <count-guard>)`.
+pub(crate) struct FastCountSink {
+    e: Expr,
+    count: usize,
+    output: Option<Vec<u8>>,
+    guard: Option<Vec<u8>>,
+}
+
+impl FastCountSink {
+    const HEADER_LEN: usize = 1 + 1 + b"count-fast".len();
+
+    fn write_result<'w, 'a, 'k>(
+        wz: &mut WriteZipperTracked<'a, 'k, ()>,
+        output: &[u8],
+    ) -> bool
+    where
+        'a: 'w,
+        'k: 'w,
+    {
+        let prefix = wz.root_prefix_path();
+        assert!(
+            output.starts_with(prefix),
+            "count-fast output does not share its requested write prefix"
+        );
+        wz.move_to_path(&output[prefix.len()..]);
+        wz.set_val(()).is_none()
+    }
+
+    pub(crate) fn can_skip_render(&self) -> bool {
+        self.output.is_some()
+    }
+
+    pub(crate) fn skip_rendered_match(&mut self) {
+        self.count = self.count.checked_add(1).expect("count-fast overflow");
+    }
+}
+
+impl Sink for FastCountSink {
+    fn new(e: Expr) -> Self {
+        Self {
+            e,
+            count: 0,
+            output: None,
+            guard: None,
+        }
+    }
+
+    fn request(&self) -> impl Iterator<Item = WriteResourceRequest> {
+        let prefix = unsafe {
+            self.e
+                .prefix()
+                .unwrap_or_else(|_| {
+                    let span = self.e.span();
+                    std::slice::from_raw_parts(self.e.ptr, span.len() - 1)
+                })
+                .as_ref()
+                .unwrap()
+        };
+        std::iter::once(WriteResourceRequest::BTM(
+            &prefix[Self::HEADER_LEN..],
+        ))
+    }
+
+    fn sink<'w, 'a, 'k, It: Iterator<Item = WriteResource<'w, 'a, 'k>>>(
+        &mut self,
+        mut it: It,
+        path: &[u8],
+    ) where
+        'a: 'w,
+        'k: 'w,
+    {
+        let WriteResource::BTM(_) = it.next().unwrap() else {
+            unreachable!()
+        };
+        self.count = self.count.checked_add(1).expect("count-fast overflow");
+
+        if self.output.is_some() {
+            return;
+        }
+
+        let expression = Expr {
+            ptr: path.as_ptr().cast_mut(),
+        };
+        let mut args = Vec::with_capacity(3);
+        ExprEnv::new(0, expression).args(&mut args);
+        debug_assert_eq!(args.len(), 3);
+
+        let output = args[1].subsexpr();
+        let output = unsafe { output.span().as_ref().unwrap() };
+        let guard = args[2].subsexpr();
+        let guard = unsafe { guard.span().as_ref().unwrap() };
+
+        self.output = Some(output.to_vec());
+        self.guard = Some(guard.to_vec());
+    }
+
+    fn finalize<'w, 'a, 'k, It: Iterator<Item = WriteResource<'w, 'a, 'k>>>(
+        &mut self,
+        mut it: It,
+    ) -> bool
+    where
+        'a: 'w,
+        'k: 'w,
+    {
+        let WriteResource::BTM(wz) = it.next().unwrap() else {
+            unreachable!()
+        };
+        wz.reset();
+
+        let (Some(output), Some(guard)) = (self.output.take(), self.guard.take()) else {
+            return false;
+        };
+        let count = self.count;
+        self.count = 0;
+        let count_string = count.to_string();
+
+        match mork_expr::byte_item(guard[0]) {
+            Tag::NewVar => Self::write_result(wz, &output),
+            Tag::VarRef(index) => {
+                let mut encoded_count = Vec::with_capacity(1 + count_string.len());
+                encoded_count.push(item_byte(Tag::SymbolSize(count_string.len() as _)));
+                encoded_count.extend_from_slice(count_string.as_bytes());
+
+                let output_expression = Expr {
+                    ptr: output.as_ptr().cast_mut(),
+                };
+                let count_expression = Expr {
+                    ptr: encoded_count.as_mut_ptr(),
+                };
+                let mut rendered = vec![0_u8; output.len() + encoded_count.len()];
+                let mut zipper = ExprZipper::new(Expr {
+                    ptr: rendered.as_mut_ptr(),
+                });
+                output_expression.substitute_one_de_bruijn(index, count_expression, &mut zipper);
+                rendered.truncate(zipper.loc);
+                Self::write_result(wz, &rendered)
+            }
+            Tag::SymbolSize(size) => {
+                let size = size as usize;
+                if guard.len() == size + 1 && &guard[1..] == count_string.as_bytes() {
+                    Self::write_result(wz, &output)
+                } else {
+                    false
+                }
+            }
+            tag => panic!("unsupported count-fast guard: {tag:?}"),
+        }
+    }
 }
 
 pub fn register(scope: &mut EvalScope) {

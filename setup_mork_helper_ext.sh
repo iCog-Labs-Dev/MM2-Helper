@@ -23,7 +23,7 @@ if [[ ! -f "$HELPER_EXT_SRC" ]]; then
   exit 1
 fi
 
-if [[ ! -d "$MORK_DIR/.git" ]]; then
+if ! git -C "$MORK_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "MORK repo not found at $MORK_DIR. Cloning from $UPSTREAM_URL ..."
   git clone "$UPSTREAM_URL" "$MORK_DIR"
 fi
@@ -36,9 +36,10 @@ fi
 
 LIB_RS="$MORK_DIR/kernel/src/lib.rs"
 SINKS_RS="$MORK_DIR/kernel/src/sinks.rs"
+FAST_COUNT_INSTALLER="$SCRIPT_DIR/install_fast_count_sink.sh"
 HELPER_EXT_DST="$MORK_DIR/kernel/src/helper_ext.rs"
 
-for f in "$LIB_RS" "$SINKS_RS"; do
+for f in "$LIB_RS" "$SINKS_RS" "$FAST_COUNT_INSTALLER"; do
   if [[ ! -f "$f" ]]; then
     echo "ERROR: expected file missing: $f" >&2
     exit 1
@@ -82,6 +83,8 @@ else
   echo "ERROR: could not find pure::register(&mut scope); in $SINKS_RS" >&2
   exit 1
 fi
+
+bash "$FAST_COUNT_INSTALLER" "$MORK_DIR"
 
 echo "Building MORK ..."
 (
