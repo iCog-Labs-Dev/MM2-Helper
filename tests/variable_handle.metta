@@ -64,3 +64,10 @@
   (, (tuple-var-sample $v))
   (O (pure (is-var-result tuple-marker $out) $out
        (i8_to_string (is_var (' $v))))))
+
+(vars-in-sample (Relation fixed (Wrapper (var 0)) (Pair (var 1) (var 0))))
+
+(exec 12
+  (, (vars-in-sample $v))
+  (O (pure (indexed-vars-result $out) $out
+       (indexed_vars_in_expr (' $v)))))

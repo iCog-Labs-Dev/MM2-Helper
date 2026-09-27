@@ -1,6 +1,8 @@
 use eval::{EvalScope, FuncType};
 use eval_ffi::{EvalError, ExprSink, ExprSource, Tag};
 use mork_expr::{item_byte, Expr, ExprEnv, ExprZipper, SourceItem};
+use crate::sinks::{Sink, WriteResource, WriteResourceRequest};
+use pathmap::zipper::{WriteZipperTracked, ZipperAbsolutePath, ZipperMoving, ZipperWriting};
 use std::collections::{HashMap, HashSet};
 
 fn expr_span(e: Expr) -> &'static [u8] {
@@ -23,6 +25,15 @@ fn tuple_items(tuple_expr: Expr) -> Result<Vec<Expr>, EvalError> {
             Ok(env_items.into_iter().map(|e| e.subsexpr()).collect())
         }
         _ => Err(EvalError::from("expects a tuple/expression argument")),
+    }
+}
+
+fn expr_symbol_bytes(e: Expr) -> Result<&'static [u8], EvalError> {
+    unsafe {
+        let Tag::SymbolSize(size) = mork_expr::byte_item(*e.ptr) else {
+            return Err(EvalError::from("expected symbol"));
+        };
+        Ok(std::slice::from_raw_parts(e.ptr.add(1), size as usize))
     }
 }
 
@@ -112,12 +123,40 @@ fn push_tuple_from_items(out: &mut Vec<u8>, items: &[Expr]) -> Result<(), EvalEr
     Ok(())
 }
 
-
 fn write_var_marker(sink: &mut ExprSink, index: usize) -> Result<(), EvalError> {
     let index = index.to_string();
     sink.write(SourceItem::Tag(Tag::Arity(2)))?;
     sink.write(SourceItem::Symbol(b"var"))?;
     sink.write(SourceItem::Symbol(index.as_bytes()))?;
+    Ok(())
+}
+
+fn collect_indexed_vars(
+    e: Expr,
+    seen: &mut HashSet<Vec<u8>>,
+    vars: &mut Vec<Vec<u8>>,
+) -> Result<(), EvalError> {
+    if var_marker_key(e)?.is_some() {
+        let bytes = expr_span(e).to_vec();
+        if seen.insert(bytes.clone()) {
+            vars.push(bytes);
+        }
+        return Ok(());
+    }
+
+    unsafe {
+        if let Tag::Arity(arity) = mork_expr::byte_item(*e.ptr) {
+            let mut offset = 1usize;
+            for _ in 0..arity {
+                let child = Expr {
+                    ptr: e.ptr.add(offset),
+                };
+                collect_indexed_vars(child, seen, vars)?;
+                offset += expr_span(child).len();
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -138,7 +177,9 @@ fn var_marker_key(e: Expr) -> Result<Option<Vec<u8>>, EvalError> {
         }
         offset += head_len as usize;
 
-        let key = Expr { ptr: e.ptr.add(offset) };
+        let key = Expr {
+            ptr: e.ptr.add(offset),
+        };
         Ok(Some(expr_span(key).to_vec()))
     }
 }
@@ -184,7 +225,9 @@ fn write_indices_as_vars(
                 sink.write(SourceItem::Tag(Tag::Arity(arity)))?;
                 let mut offset = 1usize;
                 for _ in 0..arity {
-                    let child = Expr { ptr: e.ptr.add(offset) };
+                    let child = Expr {
+                        ptr: e.ptr.add(offset),
+                    };
                     write_indices_as_vars(child, sink, labels, introduced)?;
                     offset += expr_span(child).len();
                 }
@@ -249,7 +292,9 @@ fn write_substituted_expr(
                 sink.write(SourceItem::Tag(Tag::Arity(arity)))?;
                 let mut offset = 1usize;
                 for _ in 0..arity {
-                    let child = Expr { ptr: e.ptr.add(offset) };
+                    let child = Expr {
+                        ptr: e.ptr.add(offset),
+                    };
                     write_substituted_expr(child, sink, values, state)?;
                     offset += expr_span(child).len();
                 }
@@ -276,7 +321,9 @@ fn substitute_args(expr: &mut ExprSource) -> Result<(Expr, Expr), EvalError> {
             let pattern = expr.consume::<Expr>()?;
             Ok((pattern, values))
         }
-        _ => Err(EvalError::from("substitute takes either one pair or two arguments")),
+        _ => Err(EvalError::from(
+            "substitute takes either one pair or two arguments",
+        )),
     }
 }
 
@@ -358,7 +405,9 @@ fn factorial_i64(n: i64) -> Result<i64, EvalError> {
 
 fn falling_factorial_i64(n: i64, k: i64) -> Result<i64, EvalError> {
     if n < 0 || k < 0 {
-        return Err(EvalError::from("falling_factorial expects n >= 0 and k >= 0"));
+        return Err(EvalError::from(
+            "falling_factorial expects n >= 0 and k >= 0",
+        ));
     }
     if k > n {
         return Err(EvalError::from("falling_factorial expects k <= n"));
@@ -515,6 +564,119 @@ fn write_bool(sink: &mut ExprSink, value: bool) -> Result<(), EvalError> {
     Ok(())
 }
 
+fn ln_gamma(x: f64) -> f64 {
+    const COEFFS: [f64; 9] = [
+        0.999_999_999_999_809_9,
+        676.520_368_121_885_1,
+        -1259.139_216_722_402_8,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+
+    if x < 0.5 {
+        return std::f64::consts::PI.ln()
+            - (std::f64::consts::PI * x).sin().ln()
+            - ln_gamma(1.0 - x);
+    }
+
+    let z = x - 1.0;
+    let mut a = COEFFS[0];
+    for (i, coeff) in COEFFS.iter().enumerate().skip(1) {
+        a += coeff / (z + i as f64);
+    }
+    let t = z + 7.5;
+
+    0.5 * (2.0 * std::f64::consts::PI).ln() + (z + 0.5) * t.ln() - t + a.ln()
+}
+
+fn beta_continued_fraction(a: f64, b: f64, x: f64) -> Result<f64, EvalError> {
+    const MAX_ITERATIONS: usize = 200;
+    const EPSILON: f64 = 3.0e-14;
+    const MIN_FLOAT: f64 = 1.0e-300;
+
+    let qab = a + b;
+    let qap = a + 1.0;
+    let qam = a - 1.0;
+    let mut c = 1.0;
+    let mut d = 1.0 - qab * x / qap;
+    if d.abs() < MIN_FLOAT {
+        d = MIN_FLOAT;
+    }
+    d = 1.0 / d;
+    let mut h = d;
+
+    for m in 1..=MAX_ITERATIONS {
+        let m_f = m as f64;
+        let m2 = 2.0 * m_f;
+
+        let mut aa = m_f * (b - m_f) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < MIN_FLOAT {
+            d = MIN_FLOAT;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < MIN_FLOAT {
+            c = MIN_FLOAT;
+        }
+        d = 1.0 / d;
+        h *= d * c;
+
+        aa = -(a + m_f) * (qab + m_f) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < MIN_FLOAT {
+            d = MIN_FLOAT;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < MIN_FLOAT {
+            c = MIN_FLOAT;
+        }
+        d = 1.0 / d;
+        let delta = d * c;
+        h *= delta;
+
+        if (delta - 1.0).abs() < EPSILON {
+            return Ok(h);
+        }
+    }
+
+    Err(EvalError::from(
+        "beta_cdf_f64 continued fraction did not converge",
+    ))
+}
+
+fn regularized_beta_cdf(a: f64, b: f64, x: f64) -> Result<f64, EvalError> {
+    if !a.is_finite() || !b.is_finite() || !x.is_finite() {
+        return Err(EvalError::from("beta_cdf_f64 expects finite arguments"));
+    }
+    if a <= 0.0 || b <= 0.0 {
+        return Err(EvalError::from(
+            "beta_cdf_f64 expects alpha > 0 and beta > 0",
+        ));
+    }
+    if !(0.0..=1.0).contains(&x) {
+        return Err(EvalError::from("beta_cdf_f64 expects 0 <= x <= 1"));
+    }
+    if x == 0.0 {
+        return Ok(0.0);
+    }
+    if x == 1.0 {
+        return Ok(1.0);
+    }
+
+    let front =
+        (ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b) + a * x.ln() + b * (1.0 - x).ln()).exp();
+
+    if x < (a + 1.0) / (a + b + 2.0) {
+        Ok(front * beta_continued_fraction(a, b, x)? / a)
+    } else {
+        Ok(1.0 - front * beta_continued_fraction(b, a, 1.0 - x)? / b)
+    }
+}
+
 pub extern "C" fn partitions(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
     let expr = unsafe { &mut *expr };
     let sink = unsafe { &mut *sink };
@@ -528,7 +690,10 @@ pub extern "C" fn partitions(expr: *mut ExprSource, sink: *mut ExprSink) -> Resu
 }
 
 fn expr_is_var(e: Expr) -> Result<bool, EvalError> {
-    let raw_var = matches!(unsafe { mork_expr::byte_item(*e.ptr) }, Tag::NewVar | Tag::VarRef(_));
+    let raw_var = matches!(
+        unsafe { mork_expr::byte_item(*e.ptr) },
+        Tag::NewVar | Tag::VarRef(_)
+    );
     Ok(raw_var || var_marker_key(e)?.is_some())
 }
 
@@ -560,7 +725,10 @@ pub extern "C" fn is_exp(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(
     Ok(())
 }
 
-pub extern "C" fn vars_to_indices(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
+pub extern "C" fn vars_to_indices(
+    expr: *mut ExprSource,
+    sink: *mut ExprSink,
+) -> Result<(), EvalError> {
     let expr = unsafe { &mut *expr };
     let sink = unsafe { &mut *sink };
 
@@ -579,7 +747,9 @@ pub extern "C" fn vars_to_indices(expr: *mut ExprSource, sink: *mut ExprSink) ->
             }
             Ok(Tag::VarRef(i)) => {
                 if i == 0 {
-                    return Err(EvalError::from("var reference points outside vars_to_indices argument"));
+                    return Err(EvalError::from(
+                        "var reference points outside vars_to_indices argument",
+                    ));
                 }
                 write_var_marker(sink, (i - 1) as usize)?;
             }
@@ -600,7 +770,10 @@ pub extern "C" fn vars_to_indices(expr: *mut ExprSource, sink: *mut ExprSink) ->
     Ok(())
 }
 
-pub extern "C" fn indices_to_vars(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
+pub extern "C" fn indices_to_vars(
+    expr: *mut ExprSource,
+    sink: *mut ExprSink,
+) -> Result<(), EvalError> {
     let expr = unsafe { &mut *expr };
     let sink = unsafe { &mut *sink };
 
@@ -608,6 +781,30 @@ pub extern "C" fn indices_to_vars(expr: *mut ExprSource, sink: *mut ExprSink) ->
     let mut labels = HashMap::new();
     let mut introduced = 0u8;
     write_indices_as_vars(e, sink, &mut labels, &mut introduced)
+}
+
+pub extern "C" fn indexed_vars_in_expr(
+    expr: *mut ExprSource,
+    sink: *mut ExprSink,
+) -> Result<(), EvalError> {
+    let expr = unsafe { &mut *expr };
+    let sink = unsafe { &mut *sink };
+
+    let e = consume_named_expr_1(expr, b"indexed_vars_in_expr")?;
+    let mut seen = HashSet::new();
+    let mut vars = Vec::new();
+    collect_indexed_vars(e, &mut seen, &mut vars)?;
+
+    if vars.len() > u8::MAX as usize {
+        return Err(EvalError::from("tuple arity exceeds 255"));
+    }
+
+    let mut out = Vec::new();
+    out.push(item_byte(Tag::Arity(vars.len() as u8)));
+    for var in vars {
+        out.extend_from_slice(&var);
+    }
+    write_normalized_expr(sink, out)
 }
 
 pub extern "C" fn substitute(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
@@ -652,7 +849,42 @@ pub extern "C" fn not_subsumed(expr: *mut ExprSource, sink: *mut ExprSink) -> Re
     write_bool(sink, not_subsumed_expr(pattern, other)?)
 }
 
-pub extern "C" fn freshen_pattern(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
+pub extern "C" fn subsumes(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
+    let expr = unsafe { &mut *expr };
+    let sink = unsafe { &mut *sink };
+
+    let (pattern, target) = subsumes_args(expr, b"subsumes")?;
+    write_bool(sink, strictly_subsumes_expr(pattern, target)?)
+}
+
+pub extern "C" fn can_unify(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
+    let expr = unsafe { &mut *expr };
+    let sink = unsafe { &mut *sink };
+
+    let (pattern, target) = subsumes_args(expr, b"can_unify")?;
+    write_bool(sink, strictly_subsumes_expr(pattern, target)?)
+}
+
+pub extern "C" fn subsumed_by(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
+    let expr = unsafe { &mut *expr };
+    let sink = unsafe { &mut *sink };
+
+    let (pattern, other) = subsumes_args(expr, b"subsumed_by")?;
+    write_bool(sink, is_subsumed_by_expr(pattern, other)?)
+}
+
+pub extern "C" fn not_subsumed(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
+    let expr = unsafe { &mut *expr };
+    let sink = unsafe { &mut *sink };
+
+    let (pattern, other) = subsumes_args(expr, b"not_subsumed")?;
+    write_bool(sink, not_subsumed_expr(pattern, other)?)
+}
+
+pub extern "C" fn freshen_pattern(
+    expr: *mut ExprSource,
+    sink: *mut ExprSink,
+) -> Result<(), EvalError> {
     let expr = unsafe { &mut *expr };
     let sink = unsafe { &mut *sink };
 
@@ -675,7 +907,10 @@ pub extern "C" fn factorial(expr: *mut ExprSource, sink: *mut ExprSink) -> Resul
     Ok(())
 }
 
-pub extern "C" fn falling_factorial(expr: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
+pub extern "C" fn falling_factorial(
+    expr: *mut ExprSource,
+    sink: *mut ExprSink,
+) -> Result<(), EvalError> {
     let expr = unsafe { &mut *expr };
     let sink = unsafe { &mut *sink };
 
@@ -691,6 +926,178 @@ pub extern "C" fn falling_factorial(expr: *mut ExprSource, sink: *mut ExprSink) 
     Ok(())
 }
 
+pub extern "C" fn beta_cdf_f64(
+    expr: *mut ExprSource,
+    sink: *mut ExprSink,
+) -> Result<(), EvalError> {
+    let expr = unsafe { &mut *expr };
+    let sink = unsafe { &mut *sink };
+
+    let items = expr.consume_head_check(b"beta_cdf_f64")?;
+    if items != 3 {
+        return Err(EvalError::from("beta_cdf_f64 takes three arguments"));
+    }
+
+    let alpha = expr.consume::<f64>()?;
+    let beta = expr.consume::<f64>()?;
+    let x = expr.consume::<f64>()?;
+    let result = regularized_beta_cdf(alpha, beta, x)?;
+    sink.write(SourceItem::Symbol(result.to_be_bytes()[..].into()))?;
+    Ok(())
+}
+
+// Counts complete support assignments without retaining their bindings.
+// MM2-Helper's installer wires this into MORK's sink dispatcher as
+// `(count-fast <output> <count-guard>)`.
+pub(crate) struct FastCountSink {
+    e: Expr,
+    count: usize,
+    output: Option<Vec<u8>>,
+    guard: Option<Vec<u8>>,
+}
+
+impl FastCountSink {
+    const HEADER_LEN: usize = 1 + 1 + b"count-fast".len();
+
+    fn write_result<'w, 'a, 'k>(
+        wz: &mut WriteZipperTracked<'a, 'k, ()>,
+        output: &[u8],
+    ) -> bool
+    where
+        'a: 'w,
+        'k: 'w,
+    {
+        let prefix = wz.root_prefix_path();
+        assert!(
+            output.starts_with(prefix),
+            "count-fast output does not share its requested write prefix"
+        );
+        wz.move_to_path(&output[prefix.len()..]);
+        wz.set_val(()).is_none()
+    }
+
+    pub(crate) fn can_skip_render(&self) -> bool {
+        self.output.is_some()
+    }
+
+    pub(crate) fn skip_rendered_match(&mut self) {
+        self.count = self.count.checked_add(1).expect("count-fast overflow");
+    }
+}
+
+impl Sink for FastCountSink {
+    fn new(e: Expr) -> Self {
+        Self {
+            e,
+            count: 0,
+            output: None,
+            guard: None,
+        }
+    }
+
+    fn request(&self) -> impl Iterator<Item = WriteResourceRequest> {
+        let prefix = unsafe {
+            self.e
+                .prefix()
+                .unwrap_or_else(|_| {
+                    let span = self.e.span();
+                    std::slice::from_raw_parts(self.e.ptr, span.len() - 1)
+                })
+                .as_ref()
+                .unwrap()
+        };
+        std::iter::once(WriteResourceRequest::BTM(
+            &prefix[Self::HEADER_LEN..],
+        ))
+    }
+
+    fn sink<'w, 'a, 'k, It: Iterator<Item = WriteResource<'w, 'a, 'k>>>(
+        &mut self,
+        mut it: It,
+        path: &[u8],
+    ) where
+        'a: 'w,
+        'k: 'w,
+    {
+        let WriteResource::BTM(_) = it.next().unwrap() else {
+            unreachable!()
+        };
+        self.count = self.count.checked_add(1).expect("count-fast overflow");
+
+        if self.output.is_some() {
+            return;
+        }
+
+        let expression = Expr {
+            ptr: path.as_ptr().cast_mut(),
+        };
+        let mut args = Vec::with_capacity(3);
+        ExprEnv::new(0, expression).args(&mut args);
+        debug_assert_eq!(args.len(), 3);
+
+        let output = args[1].subsexpr();
+        let output = unsafe { output.span().as_ref().unwrap() };
+        let guard = args[2].subsexpr();
+        let guard = unsafe { guard.span().as_ref().unwrap() };
+
+        self.output = Some(output.to_vec());
+        self.guard = Some(guard.to_vec());
+    }
+
+    fn finalize<'w, 'a, 'k, It: Iterator<Item = WriteResource<'w, 'a, 'k>>>(
+        &mut self,
+        mut it: It,
+    ) -> bool
+    where
+        'a: 'w,
+        'k: 'w,
+    {
+        let WriteResource::BTM(wz) = it.next().unwrap() else {
+            unreachable!()
+        };
+        wz.reset();
+
+        let (Some(output), Some(guard)) = (self.output.take(), self.guard.take()) else {
+            return false;
+        };
+        let count = self.count;
+        self.count = 0;
+        let count_string = count.to_string();
+
+        match mork_expr::byte_item(guard[0]) {
+            Tag::NewVar => Self::write_result(wz, &output),
+            Tag::VarRef(index) => {
+                let mut encoded_count = Vec::with_capacity(1 + count_string.len());
+                encoded_count.push(item_byte(Tag::SymbolSize(count_string.len() as _)));
+                encoded_count.extend_from_slice(count_string.as_bytes());
+
+                let output_expression = Expr {
+                    ptr: output.as_ptr().cast_mut(),
+                };
+                let count_expression = Expr {
+                    ptr: encoded_count.as_mut_ptr(),
+                };
+                let mut rendered = vec![0_u8; output.len() + encoded_count.len()];
+                let mut zipper = ExprZipper::new(Expr {
+                    ptr: rendered.as_mut_ptr(),
+                });
+                output_expression.substitute_one_de_bruijn(index, count_expression, &mut zipper);
+                rendered.truncate(zipper.loc);
+                Self::write_result(wz, &rendered)
+            }
+            Tag::SymbolSize(size) => {
+                let size = size as usize;
+                if guard.len() == size + 1 && &guard[1..] == count_string.as_bytes() {
+                    Self::write_result(wz, &output)
+                } else {
+                    false
+                }
+            }
+            tag => panic!("unsupported count-fast guard: {tag:?}"),
+        }
+    }
+}
+
 pub fn register(scope: &mut EvalScope) {
     scope.add_func("partitions", partitions, FuncType::Pure);
     scope.add_func("is_var", is_var, FuncType::Pure);
@@ -698,6 +1105,7 @@ pub fn register(scope: &mut EvalScope) {
     scope.add_func("is-exp", is_exp, FuncType::Pure);
     scope.add_func("vars_to_indices", vars_to_indices, FuncType::Pure);
     scope.add_func("indices_to_vars", indices_to_vars, FuncType::Pure);
+    scope.add_func("indexed_vars_in_expr", indexed_vars_in_expr, FuncType::Pure);
     scope.add_func("substitute", substitute, FuncType::Pure);
     scope.add_func("subsumes", subsumes, FuncType::Pure);
     scope.add_func("can_unify", can_unify, FuncType::Pure);
@@ -706,4 +1114,5 @@ pub fn register(scope: &mut EvalScope) {
     scope.add_func("freshen-pattern", freshen_pattern, FuncType::Pure);
     scope.add_func("factorial", factorial, FuncType::Pure);
     scope.add_func("falling_factorial", falling_factorial, FuncType::Pure);
+    scope.add_func("beta_cdf_f64", beta_cdf_f64, FuncType::Pure);
 }

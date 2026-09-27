@@ -8,9 +8,14 @@ Current helpers included:
 - `is_var`
 - `vars_to_indices`
 - `indices_to_vars`
+- `indexed_vars_in_expr`
 - `freshen-pattern`
 - `factorial`
 - `falling_factorial`
+- `beta_cdf_f64`
+- `kld_f64`
+- `count-fast`, an installable streaming sink for counting complete support
+  assignments without retaining every matched binding
 
 Tuple/list helpers such as `length`, `car`, `cdr`, `cons`, and `decons`
 are intentionally not implemented here anymore. They are provided by
@@ -35,13 +40,33 @@ Safe binomial-style usage:
       (factorial (i64_from_string 3)))))
 ```
 
+Beta CDF usage:
+
+```lisp
+(pure (beta-cdf-result $out) $out
+  (f64_to_string
+    (beta_cdf_f64
+      (f64_from_string 2.0)
+      (f64_from_string 3.0)
+      (f64_from_string 0.5))))
+```
+
+KLD usage over two CDF tuples:
+
+```lisp
+(pure (kld-result $out) $out
+  (f64_to_string
+    (kld_f64 (' (0.5 1.0)) (' (0.5 1.0)))))
+```
+
 
 ## What this package does
 
 This package applies a small patch to a MORK checkout:
 
 1. Copies `helper_ext.rs` into `kernel/src/helper_ext.rs`
-2. Wires module/import/registration in kernel sources
+2. Wires module/import/registration and the helper-owned `count-fast` sink
+   dispatcher into kernel sources
 3. Builds MORK release binary
 4. Installs a user-level `mork` launcher so the binary can be run without an absolute path
 
