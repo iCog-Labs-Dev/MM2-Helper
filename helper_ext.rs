@@ -1066,6 +1066,131 @@ impl Sink for FastCountSink {
     }
 }
 
+// Counts a conjunction through MORK's factorized-count query path. Unlike
+// `count-fast`, this sink always owns an output, including when the count is
+// zero. Its output and guard therefore must not depend on source bindings.
+pub(crate) struct FactorizedCountSink {
+    e: Expr,
+    count: usize,
+    output: Vec<u8>,
+    guard: Vec<u8>,
+}
+
+impl FactorizedCountSink {
+    const HEADER_LEN: usize = 1 + 1 + b"count-factorized".len();
+
+    pub(crate) fn set_count(&mut self, count: usize) {
+        self.count = count;
+    }
+
+    pub(crate) fn skip_rendered_match(&mut self) {
+        self.count = self
+            .count
+            .checked_add(1)
+            .expect("count-factorized overflow");
+    }
+}
+
+impl Sink for FactorizedCountSink {
+    fn new(e: Expr) -> Self {
+        let mut args = Vec::with_capacity(3);
+        ExprEnv::new(0, e).args(&mut args);
+        assert_eq!(args.len(), 3, "count-factorized takes two arguments");
+        let output = unsafe { args[1].subsexpr().span().as_ref().unwrap() }.to_vec();
+        let guard = unsafe { args[2].subsexpr().span().as_ref().unwrap() }.to_vec();
+        Self {
+            e,
+            count: 0,
+            output,
+            guard,
+        }
+    }
+
+    fn request(&self) -> impl Iterator<Item = WriteResourceRequest> {
+        let prefix = unsafe {
+            self.e
+                .prefix()
+                .unwrap_or_else(|_| {
+                    let span = self.e.span();
+                    std::slice::from_raw_parts(self.e.ptr, span.len() - 1)
+                })
+                .as_ref()
+                .unwrap()
+        };
+        std::iter::once(WriteResourceRequest::BTM(
+            &prefix[Self::HEADER_LEN..],
+        ))
+    }
+
+    fn sink<'w, 'a, 'k, It: Iterator<Item = WriteResource<'w, 'a, 'k>>>(
+        &mut self,
+        mut it: It,
+        _path: &[u8],
+    ) where
+        'a: 'w,
+        'k: 'w,
+    {
+        let WriteResource::BTM(_) = it.next().unwrap() else {
+            unreachable!()
+        };
+        self.skip_rendered_match();
+    }
+
+    fn finalize<'w, 'a, 'k, It: Iterator<Item = WriteResource<'w, 'a, 'k>>>(
+        &mut self,
+        mut it: It,
+    ) -> bool
+    where
+        'a: 'w,
+        'k: 'w,
+    {
+        let WriteResource::BTM(wz) = it.next().unwrap() else {
+            unreachable!()
+        };
+        wz.reset();
+
+        let count_string = self.count.to_string();
+        self.count = 0;
+        match mork_expr::byte_item(self.guard[0]) {
+            Tag::NewVar => FastCountSink::write_result(wz, &self.output),
+            Tag::VarRef(_index) => {
+                let mut encoded_count = Vec::with_capacity(1 + count_string.len());
+                encoded_count.push(item_byte(Tag::SymbolSize(count_string.len() as _)));
+                encoded_count.extend_from_slice(count_string.as_bytes());
+
+                let output_expression = Expr {
+                    ptr: self.output.as_ptr().cast_mut(),
+                };
+                let count_expression = Expr {
+                    ptr: encoded_count.as_mut_ptr(),
+                };
+                let mut rendered = vec![0_u8; self.output.len() + encoded_count.len()];
+                let mut zipper = ExprZipper::new(Expr {
+                    ptr: rendered.as_mut_ptr(),
+                });
+                // The raw sink keeps the guard's index from the complete
+                // exec, while this isolated output starts its own variable
+                // scope. The count-factorized contract permits exactly the
+                // locally introduced output variable here.
+                output_expression.substitute_one_de_bruijn(0, count_expression, &mut zipper);
+                rendered.truncate(zipper.loc);
+                FastCountSink::write_result(wz, &rendered)
+            }
+            Tag::SymbolSize(size) => {
+                let size = size as usize;
+                if self.guard.len() == size + 1
+                    && &self.guard[1..] == count_string.as_bytes()
+                {
+                    FastCountSink::write_result(wz, &self.output)
+                } else {
+                    false
+                }
+            }
+            tag => panic!("unsupported count-factorized guard: {tag:?}"),
+        }
+    }
+}
+
 pub fn register(scope: &mut EvalScope) {
     scope.add_func("partitions", partitions, FuncType::Pure);
     scope.add_func("is_var", is_var, FuncType::Pure);

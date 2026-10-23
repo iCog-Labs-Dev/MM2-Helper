@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 UPSTREAM_URL="${MORK_UPSTREAM_URL:-https://github.com/trueagi-io/MORK}"
 PATHMAP_URL="https://github.com/Adam-Vandervorst/PathMap.git"
 HELPER_EXT_SRC="$SCRIPT_DIR/helper_ext.rs"
+FACTORIZED_COUNT_SRC="$SCRIPT_DIR/factorized_count.rs"
 
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 /absolute/path/to/MORK" >&2
@@ -20,6 +21,10 @@ PATHMAP_DIR="$PARENT_DIR/PathMap"
 
 if [[ ! -f "$HELPER_EXT_SRC" ]]; then
   echo "ERROR: helper_ext.rs not found at $HELPER_EXT_SRC" >&2
+  exit 1
+fi
+if [[ ! -f "$FACTORIZED_COUNT_SRC" ]]; then
+  echo "ERROR: factorized_count.rs not found at $FACTORIZED_COUNT_SRC" >&2
   exit 1
 fi
 
@@ -38,6 +43,7 @@ LIB_RS="$MORK_DIR/kernel/src/lib.rs"
 SINKS_RS="$MORK_DIR/kernel/src/sinks.rs"
 FAST_COUNT_INSTALLER="$SCRIPT_DIR/install_fast_count_sink.sh"
 HELPER_EXT_DST="$MORK_DIR/kernel/src/helper_ext.rs"
+FACTORIZED_COUNT_DST="$MORK_DIR/kernel/src/factorized_count.rs"
 
 for f in "$LIB_RS" "$SINKS_RS" "$FAST_COUNT_INSTALLER"; do
   if [[ ! -f "$f" ]]; then
@@ -48,6 +54,7 @@ done
 
 echo "Copying helper extension file ..."
 cp "$HELPER_EXT_SRC" "$HELPER_EXT_DST"
+cp "$FACTORIZED_COUNT_SRC" "$FACTORIZED_COUNT_DST"
 
 # Migrate legacy tuple_ext marker if present
 perl -0pi -e 's/mod tuple_ext;/mod helper_ext;/' "$LIB_RS"
@@ -57,8 +64,9 @@ perl -0pi -e 's/use crate::\{expr, pure, tuple_ext\};/use crate::{expr, pure, he
 
 # Ensure lib.rs has exactly one helper_ext module declaration, placed after mod pure;
 perl -0pi -e 's/^mod helper_ext;\n//mg' "$LIB_RS"
+perl -0pi -e 's/^mod factorized_count;\n//mg' "$LIB_RS"
 if grep -q '^mod pure;$' "$LIB_RS"; then
-  perl -0pi -e 's/mod pure;\n/mod pure;\nmod helper_ext;\n/' "$LIB_RS"
+  perl -0pi -e 's/mod pure;\n/mod pure;\nmod helper_ext;\nmod factorized_count;\n/' "$LIB_RS"
 else
   echo "ERROR: expected 'mod pure;' in $LIB_RS" >&2
   exit 1

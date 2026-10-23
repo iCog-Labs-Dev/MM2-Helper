@@ -16,6 +16,9 @@ Current helpers included:
 - `kld_f64`
 - `count-fast`, an installable streaming sink for counting complete support
   assignments without retaining every matched binding
+- `count-factorized`, an exact grouped counter for ordinary atom-space
+  conjunctions that avoids enumerating their Cartesian result; unsupported
+  query shapes automatically use the streaming matcher
 
 Tuple/list helpers such as `length`, `car`, `cdr`, `cons`, and `decons`
 are intentionally not implemented here anymore. They are provided by
@@ -65,8 +68,8 @@ KLD usage over two CDF tuples:
 This package applies a small patch to a MORK checkout:
 
 1. Copies `helper_ext.rs` into `kernel/src/helper_ext.rs`
-2. Wires module/import/registration and the helper-owned `count-fast` sink
-   dispatcher into kernel sources
+2. Wires module/import/registration and the helper-owned `count-fast` and
+   `count-factorized` sink dispatchers into kernel sources
 3. Builds MORK release binary
 4. Installs a user-level `mork` launcher so the binary can be run without an absolute path
 
